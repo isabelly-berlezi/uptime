@@ -1,0 +1,86 @@
+name: keepalive
+
+# Render's free tier spins a web service down after 15 minutes without an HTTP
+# request or a WebSocket message, and waking it costs about 22 seconds measured
+# first-hand. The demo this pings is linked from a CV, so the first person to
+# open it must not be the one who pays that.
+#
+# Every 10 minutes, which leaves one spare firing inside each 15 minute window.
+# GitHub's scheduled events are best-effort and can be delayed under load, so
+# treat this as reducing the odds of a cold start rather than eliminating them.
+# A purpose-built monitor is more punctual if this proves not to be enough.
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: keepalive
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wake the demo
+        run: |
+          set -uo pipefail
+          URL="https://crdt-editor-ivor.onrender.com/"
+
+          # Must be a real route the app serves. Render answers /robots.txt
+          # itself while a service is asleep, so pinging that path never
+          # reaches the service and never wakes it.
+          #
+          # Not /health either: it reports on a Postgres this deployment
+          # deliberately does not have and answers 503 by design, so a healthy
+          # service would look like a failing one here.
+
+          # A cold start is slow by definition, so the timeout has to allow for
+          # it. Three attempts, because a single blip should not turn the whole
+          # run red.
+          for attempt in 1 2 3; do
+            code=$(curl -sS -o /dev/null -w '%{http_code}' \
+                     --max-time 90 --connect-timeout 20 "$URL" || echo 000)
+            printf 'attempt %d: HTTP %s\n' "$attempt" "$code"
+            if [ "$code" = "200" ]; then
+              echo "awake"
+              exit 0
+            fi
+            [ "$attempt" -lt 3 ] && sleep 20
+          done
+
+          echo "::error::demo did not return 200 after 3 attempts"
+          exit 1
+
+      - name: Checkout
+        if: always()
+        uses: actions/checkout@v4
+
+      - name: Keep the repository active
+        if: always()
+        run: |
+          set -euo pipefail
+
+          # GitHub disables scheduled workflows in a repository that has seen no
+          # activity for 60 days. This workflow commits nothing on its own, so
+          # without a heartbeat it would switch itself off after two months and
+          # the demo would start sleeping again silently.
+          #
+          # Date-compared rather than time-scheduled, so it still lands exactly
+          # once a day even when the cron fires late.
+          today=$(date -u +%F)
+          if [ "$(cat .heartbeat 2>/dev/null || true)" = "$today" ]; then
+            echo "heartbeat already written for $today"
+            exit 0
+          fi
+
+          echo "$today" > .heartbeat
+          git config user.name  'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add .heartbeat
+          git commit -m "chore: heartbeat $today"
+          git push
